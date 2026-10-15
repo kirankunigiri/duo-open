@@ -44,17 +44,26 @@ class HingeAngleSource(
             get() = sensor.resolution.takeIf { it.isFinite() && it > 0f } ?: 1f
         val isStandard: Boolean get() = sensor.type == Sensor.TYPE_HINGE_ANGLE
 
+        /** Seen a reading between the stops: the sensor is continuous, for good. */
+        var sawIntermediate = false
+
         fun observe(value: Float) {
             events++
             last = value
-            if (distinct.size < MAX_DISTINCT) distinct += value.roundToInt()
+            val rounded = value.roundToInt()
+            if (distinct.size < MAX_DISTINCT) distinct += rounded
+            if (STOPS.none { abs(rounded - it) <= 2 }) sawIntermediate = true
         }
 
-        /** Only ever 0/90/180 (±2°) after enough events, or declared so. */
+        /**
+         * Only ever 0/90/180 (±2°) across at least two different stops, or
+         * declared so. A phone resting closed (or flat) reports a single stop
+         * over and over; that says nothing about the sensor's resolution.
+         */
         val looksCoarse: Boolean
             get() = resolution >= COARSE_RESOLUTION ||
-                (events >= COARSE_MIN_EVENTS && distinct.size <= 3 &&
-                    distinct.all { v -> STOPS.any { abs(v - it) <= 2 } })
+                (!sawIntermediate && events >= COARSE_MIN_EVENTS &&
+                    STOPS.count { s -> distinct.any { abs(it - s) <= 2 } } >= 2)
     }
 
     private val sensorManager = context.getSystemService(SensorManager::class.java)

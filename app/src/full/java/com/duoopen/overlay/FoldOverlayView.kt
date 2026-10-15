@@ -97,7 +97,7 @@ class FoldOverlayView(
         }
 
         override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
-            matrix.setScale(w / snapshot.width.toFloat(), h / snapshot.height.toFloat())
+            matrix.centerCrop(snapshot, w, h)
             shader.setLocalMatrix(matrix)
             paint.shader = shader
         }
@@ -138,7 +138,7 @@ class FoldOverlayView(
             }
 
         override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
-            matrix.setScale(w / snapshot.width.toFloat(), h / snapshot.height.toFloat())
+            matrix.centerCrop(snapshot, w, h)
             image.setLocalMatrix(matrix)
         }
 
@@ -159,4 +159,17 @@ class FoldOverlayView(
             canvas.drawRect(0f, 0f, w, h, paint)
         }
     }
+}
+
+/**
+ * Fits [bitmap] to a w×h view with one uniform scale, cropping the overflow
+ * evenly — a capture whose aspect differs slightly from the view (rotation,
+ * cutout insets, half-res live frames) must never be stretched.
+ */
+private fun Matrix.centerCrop(bitmap: Bitmap, w: Int, h: Int) {
+    val bw = bitmap.width.toFloat()
+    val bh = bitmap.height.toFloat()
+    val scale = maxOf(w / bw, h / bh)
+    setScale(scale, scale)
+    postTranslate((w - bw * scale) / 2f, (h - bh * scale) / 2f)
 }

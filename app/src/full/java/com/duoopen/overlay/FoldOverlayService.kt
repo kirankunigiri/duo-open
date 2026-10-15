@@ -10,6 +10,7 @@ import android.content.IntentFilter
 import android.hardware.display.DisplayManager
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import android.view.Display
@@ -63,7 +64,10 @@ class FoldOverlayService : AccessibilityService() {
         super.onServiceConnected()
         instance = this
         if (!receiverRegistered) {
-            registerReceiver(demoReceiver, IntentFilter(ACTION_DEMO), RECEIVER_EXPORTED)
+            // Exported so `adb shell am broadcast` works, but gated on DUMP, which
+            // the shell holds and ordinary apps can't — otherwise any app could
+            // trigger a capture-and-play.
+            registerReceiver(demoReceiver, IntentFilter(ACTION_DEMO), DEMO_PERMISSION, null, RECEIVER_EXPORTED)
             receiverRegistered = true
         }
         displayManager = getSystemService(DisplayManager::class.java)
@@ -94,8 +98,17 @@ class FoldOverlayService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
     override fun onInterrupt() = Unit
 
+    private var lastHingeSyncMs = 0L
+
     private fun onHinge(angle: Float) {
-        syncDisplays()
+        // The hinge reports ~50 Hz mid-fold and each sync is several binder
+        // calls on the main thread; display changes arrive through the
+        // listener anyway, so a periodic re-check is plenty here.
+        val now = SystemClock.uptimeMillis()
+        if (now - lastHingeSyncMs >= HINGE_SYNC_INTERVAL_MS) {
+            lastHingeSyncMs = now
+            syncDisplays()
+        }
         for (e in engines.values.toList()) e.onHinge(angle)
     }
 
@@ -155,8 +168,10 @@ class FoldOverlayService : AccessibilityService() {
         private const val TAG = "DuoOverlay"
         const val ACTION_DEMO = "com.duoopen.DEMO"
         private const val TEST_DISPLAYS_SETTING = "duoopen_test_displays"
-        /** How old a panel's last picture may be and still bridge the next fold. */
-        private const val SNAPSHOT_MAX_AGE_MS = 15 * 60_000L
+        private const val DEMO_PERMISSION = "android.permission.DUMP"
+        /** How old a panel's last picture may be and still bridge the next fold (kept in memory only). */
+        private const val SNAPSHOT_MAX_AGE_MS = 3 * 60_000L
+        private const val HINGE_SYNC_INTERVAL_MS = 50L
 
         /** The connected service, for in-process control from the app. */
         @Volatile

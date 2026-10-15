@@ -31,13 +31,13 @@ object DuoShader {
      * OnePlus Open reads 176–179° when open), which would otherwise leave a
      * faint permanent frost at the edges.
      */
-    const val FLAT_HINGE = 172f
+    val FLAT_HINGE: Float get() = DeviceProfile.current.flatHinge
 
-    /** Hinge angle at which the panels swap (OnePlus Open: ~20°). */
-    const val PANEL_ON_HINGE = 20f
+    /** Hinge angle at which the panels swap (OnePlus Open: ~20°, Find N6: ~10°). */
+    val PANEL_ON_HINGE: Float get() = DeviceProfile.current.panelOnHinge
 
-    /** A closed OnePlus Open idles anywhere from 0° to ~5°; below this the cover counts as at rest. */
-    const val CLOSED_HINGE = 6f
+    /** A closed phone idles below this (OnePlus Open: 0–5°); the cover counts as at rest. */
+    val CLOSED_HINGE: Float get() = DeviceProfile.current.closedHinge
 
     private const val TAG = "DuoShader"
     private const val REFERENCE_PX_PER_MM = 6f

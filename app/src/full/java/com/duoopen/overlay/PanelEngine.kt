@@ -7,6 +7,7 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.Display
 import android.view.WindowManager
+import com.duoopen.fold.DeviceProfile
 import com.duoopen.fold.DuoShader
 import com.duoopen.fold.HingeAngleSource
 import com.duoopen.fold.TiltFollower
@@ -382,8 +383,9 @@ class PanelEngine(
         // onHinge) or the hold cap expires.
         val tilt = startTilt ?: if (coarse) (if (afterSwap) peak else DuoShader.FLAT_EPSILON * 1.2f) else currentTilt()
         // A capture lands late; the live blur is instant, so it's never "too late".
+        val profile = DeviceProfile.current
         val nearlyDone = bitmap != null && afterSwap && live &&
-            if (innerPanel) angle > SKIP_INNER_ABOVE_HINGE else angle < SKIP_COVER_BELOW_HINGE
+            if (innerPanel) angle > profile.skipInnerAboveHinge else angle < profile.skipCoverBelowHinge
         if (tilt < DuoShader.FLAT_EPSILON || nearlyDone) {
             // Too late to be worth a pop-in: the fold is (almost) over.
             Log.i(TAG, "display $displayId: hinge=$angle by capture time (${SystemClock.uptimeMillis() - t0}ms); skipping")
@@ -593,9 +595,6 @@ class PanelEngine(
         const val COARSE_PEAK_HOLD_MS = 2_500L
         /** Tilt hysteresis for leaving a rest pose, so hinge jitter doesn't fire. */
         const val REST_LEAVE_TILT = 3f
-        /** After a swap, don't bother if the fold is nearly finished by capture time. */
-        const val SKIP_INNER_ABOVE_HINGE = 135f
-        const val SKIP_COVER_BELOW_HINGE = 10f
         const val SETTLE_TIMEOUT_MS = 700L
         const val FADE_IN_MS = 140L
         const val FADE_OUT_FLAT_MS = 120L

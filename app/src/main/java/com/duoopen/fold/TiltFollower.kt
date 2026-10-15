@@ -21,6 +21,8 @@ class TiltFollower(private val onFrame: (tilt: Float) -> Unit) : Choreographer.F
 
     private var scheduled = false
     private var lastFrameNanos = 0L
+    /** Bumped by [cancel], so an [onFrame] that cancels (e.g. dismiss at flat) can't reschedule. */
+    private var generation = 0
 
     fun setTarget(tilt: Float) {
         target = tilt
@@ -35,6 +37,7 @@ class TiltFollower(private val onFrame: (tilt: Float) -> Unit) : Choreographer.F
     }
 
     fun cancel() {
+        generation++
         if (!scheduled) return
         scheduled = false
         lastFrameNanos = 0L
@@ -56,7 +59,9 @@ class TiltFollower(private val onFrame: (tilt: Float) -> Unit) : Choreographer.F
         current += (target - current) * (1f - exp(-dt / tauS))
         if (abs(target - current) < 0.02f) current = target
 
+        val gen = generation
         onFrame(current)
+        if (gen != generation) return // cancelled from inside onFrame
         if (current != target) schedule() else lastFrameNanos = 0L
     }
 
