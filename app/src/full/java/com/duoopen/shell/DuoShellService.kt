@@ -134,8 +134,9 @@ class DuoShellService : Binder() {
             }
             ShellProtocol.MIRROR_START -> {
                 val src = data.readInt()
+                val align = if (data.dataAvail() > 0) data.readInt() else 0
                 val identity = clearCallingIdentity()
-                val b = try { mirror.start(src) } finally { restoreCallingIdentity(identity) }
+                val b = try { mirror.start(src, align) } finally { restoreCallingIdentity(identity) }
                 out.writeNoException()
                 out.writeBundle(b)
             }
@@ -438,7 +439,8 @@ class DuoShellService : Binder() {
             }
         }
 
-        fun start(source: Int): Bundle = Bundle().apply {
+        /** @param align −1 = left edge, 0 = centred, +1 = right edge of the target panel. */
+        fun start(source: Int, align: Int): Bundle = Bundle().apply {
             try {
                 stop()
                 // The second panel's logical display appears a moment after the state change.
@@ -475,7 +477,9 @@ class DuoShellService : Binder() {
                 t.setVisibility(root, true)
                 t.reparent(out, root)
                 t.setScale(out, scale, scale)
-                t.setPosition(out, (tw - sw * scale) / 2f, (th - sh * scale) / 2f)
+                val spare = tw - sw * scale
+                val x = when { align > 0 -> spare; align < 0 -> 0f; else -> spare / 2f }
+                t.setPosition(out, x, (th - sh * scale) / 2f)
                 t.setVisibility(out, true)
                 t.apply()
                 host = root

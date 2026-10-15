@@ -118,7 +118,7 @@ class CoverHold(
         Log.i(TAG, "dual on at ${angle.fmt()}°: state $state + mirror")
         worker.execute {
             val ok = ShizukuBridge.holdState(state)
-            val m = if (ok) ShizukuBridge.startMirror(Display.DEFAULT_DISPLAY) else null
+            val m = if (ok) ShizukuBridge.startMirror(Display.DEFAULT_DISPLAY, DuoSettings.config.value.mirrorAlign) else null
             handler.post {
                 if (!ok) { Log.w(TAG, "dual state $state failed"); dual = false }
                 else Log.i(TAG, "mirror ${if (m?.getBoolean("ok") == true) "on display ${m.getInt("target")} (layer stack ${m.getInt("layerStack")}, scale ${m.getFloat("scale")})" else "failed: ${m?.getString("error")}"}")

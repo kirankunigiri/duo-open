@@ -227,7 +227,10 @@ object ShizukuBridge {
     }
 
     /** Blocking (waits up to ~0.6 s for the second panel to appear). */
-    fun startMirror(sourceDisplay: Int): Bundle? = call(ShellProtocol.MIRROR_START) { it.writeInt(sourceDisplay) }
+    fun startMirror(sourceDisplay: Int, align: Int): Bundle? = call(ShellProtocol.MIRROR_START) {
+        it.writeInt(sourceDisplay)
+        it.writeInt(align)
+    }
         ?.also { if (!it.getBoolean("ok")) Log.w(TAG, "mirror failed: ${it.getString("error")}") }
 
     fun stopMirror(): Boolean = call(ShellProtocol.MIRROR_STOP)?.getBoolean("ok") == true

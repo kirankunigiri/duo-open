@@ -43,6 +43,9 @@ import kotlinx.coroutines.flow.asStateFlow
  *   first degrees of opening and mirror the cover onto it (both screens on),
  *   handing over to the inner screen at [dualReleaseHinge].
  * @param dualReleaseHinge Hinge angle of that hand-over (the one ~0.3 s blink).
+ * @param mirrorAlign Where the cover's mirror sits on the inner panel while both
+ *   are lit: +1 = right edge (behind the cover on a book fold), 0 = centred,
+ *   −1 = left edge.
  * @param imageVersion Bumped whenever the wallpaper image changes.
  */
 data class DuoConfig(
@@ -61,6 +64,7 @@ data class DuoConfig(
     val holdReleaseHinge: Float = 90f,
     val dualScreen: Boolean = true,
     val dualReleaseHinge: Float = 165f,
+    val mirrorAlign: Int = 1,
     val imageVersion: Long = 0L,
 )
 
@@ -90,6 +94,7 @@ object DuoSettings {
             holdReleaseHinge = prefs.getFloat("holdReleaseHinge", d.holdReleaseHinge),
             dualScreen = prefs.getBoolean("dualScreen", d.dualScreen),
             dualReleaseHinge = prefs.getFloat("dualReleaseHinge", d.dualReleaseHinge),
+            mirrorAlign = prefs.getInt("mirrorAlign", d.mirrorAlign),
             imageVersion = prefs.getLong("imageVersion", d.imageVersion),
         )
     }
@@ -114,6 +119,7 @@ object DuoSettings {
             putFloat("holdReleaseHinge", next.holdReleaseHinge)
             putBoolean("dualScreen", next.dualScreen)
             putFloat("dualReleaseHinge", next.dualReleaseHinge)
+            putInt("mirrorAlign", next.mirrorAlign)
             putLong("imageVersion", next.imageVersion)
         }
     }
@@ -132,6 +138,7 @@ object DuoSettings {
             holdReleaseHinge = it.holdReleaseHinge,
             dualScreen = it.dualScreen,
             dualReleaseHinge = it.dualReleaseHinge,
+            mirrorAlign = it.mirrorAlign,
             imageVersion = it.imageVersion,
         )
     }
