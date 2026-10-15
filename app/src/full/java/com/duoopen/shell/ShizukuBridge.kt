@@ -226,6 +226,16 @@ object ShizukuBridge {
         return b.getBoolean("ok")
     }
 
+    /** Blocking (waits up to ~0.6 s for the second panel to appear). */
+    fun startMirror(sourceDisplay: Int): Bundle? = call(ShellProtocol.MIRROR_START) { it.writeInt(sourceDisplay) }
+        ?.also { if (!it.getBoolean("ok")) Log.w(TAG, "mirror failed: ${it.getString("error")}") }
+
+    fun stopMirror(): Boolean = call(ShellProtocol.MIRROR_STOP)?.getBoolean("ok") == true
+
+    /** Blocking (~0.2–0.4 s): dual → cover-only → released, the cheap route to the normal swap. */
+    fun handover(coverOnlyState: Int): Bundle? = call(ShellProtocol.HANDOVER) { it.writeInt(coverOnlyState) }
+        ?.also { Log.i(TAG, "handover ok=${it.getBoolean("ok")} in ${it.getLong("ms")} ms ${it.getString("error") ?: ""}") }
+
     fun releaseState(): Boolean {
         val b = call(ShellProtocol.RELEASE_STATE) ?: return false
         if (!b.getBoolean("ok")) Log.w(TAG, "release state failed: ${b.getString("error")}")

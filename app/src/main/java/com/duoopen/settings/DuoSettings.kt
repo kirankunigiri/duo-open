@@ -39,6 +39,10 @@ import kotlinx.coroutines.flow.asStateFlow
  *   the inner screen in the first few degrees, so the cover's fold plays out.
  * @param holdReleaseHinge Hinge angle at which the held cover hands over to the
  *   inner screen.
+ * @param dualScreen While holding the cover, also light the inner panel from the
+ *   first degrees of opening and mirror the cover onto it (both screens on),
+ *   handing over to the inner screen at [dualReleaseHinge].
+ * @param dualReleaseHinge Hinge angle of that hand-over (the one ~0.3 s blink).
  * @param imageVersion Bumped whenever the wallpaper image changes.
  */
 data class DuoConfig(
@@ -55,6 +59,8 @@ data class DuoConfig(
     val shizukuAngle: Boolean = true,
     val holdCover: Boolean = true,
     val holdReleaseHinge: Float = 90f,
+    val dualScreen: Boolean = true,
+    val dualReleaseHinge: Float = 165f,
     val imageVersion: Long = 0L,
 )
 
@@ -82,6 +88,8 @@ object DuoSettings {
             shizukuAngle = prefs.getBoolean("shizukuAngle", d.shizukuAngle),
             holdCover = prefs.getBoolean("holdCover", d.holdCover),
             holdReleaseHinge = prefs.getFloat("holdReleaseHinge", d.holdReleaseHinge),
+            dualScreen = prefs.getBoolean("dualScreen", d.dualScreen),
+            dualReleaseHinge = prefs.getFloat("dualReleaseHinge", d.dualReleaseHinge),
             imageVersion = prefs.getLong("imageVersion", d.imageVersion),
         )
     }
@@ -104,6 +112,8 @@ object DuoSettings {
             putBoolean("shizukuAngle", next.shizukuAngle)
             putBoolean("holdCover", next.holdCover)
             putFloat("holdReleaseHinge", next.holdReleaseHinge)
+            putBoolean("dualScreen", next.dualScreen)
+            putFloat("dualReleaseHinge", next.dualReleaseHinge)
             putLong("imageVersion", next.imageVersion)
         }
     }
@@ -120,6 +130,8 @@ object DuoSettings {
             shizukuAngle = it.shizukuAngle,
             holdCover = it.holdCover,
             holdReleaseHinge = it.holdReleaseHinge,
+            dualScreen = it.dualScreen,
+            dualReleaseHinge = it.dualReleaseHinge,
             imageVersion = it.imageVersion,
         )
     }

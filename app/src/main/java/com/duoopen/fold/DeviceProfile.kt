@@ -26,6 +26,11 @@ data class DeviceProfile(
      * CLOSED, used to hold the cover on while opening; null = unsupported.
      */
     val coverHoldState: Int? = null,
+    /**
+     * Device state with the cover still display 0 and the inner panel lit as a
+     * second display (both screens on, no swap); null = unsupported.
+     */
+    val dualState: Int? = null,
 ) {
     companion object {
         /** OnePlus Open: swaps at ~20°, idles 0–5° closed, rests at 176–179° open. */
@@ -54,6 +59,9 @@ data class DeviceProfile(
             // SUB_SCREEN_ONLY_DEFAULT: cover = display 0, inner off — the CLOSED
             // layout, so entering it from CLOSED changes nothing on screen.
             coverHoldState = 102,
+            // ALL2: cover = display 0, inner lit as display 7. 102 ↔ 100 never
+            // moves display 0, so lighting/unlighting the inner is free.
+            dualState = 100,
         )
 
         val current: DeviceProfile by lazy { detect(Build.MANUFACTURER, Build.MODEL, Build.DEVICE) }

@@ -9,6 +9,7 @@ import android.os.IBinder
 import android.os.Parcel
 import android.os.Process
 import android.os.SystemClock
+import android.view.Display
 import android.view.SurfaceControl
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -51,6 +52,7 @@ class DuoShellService : Binder() {
     private var captureApi: CaptureApi? = null
     private var reader: AngleReader? = null
     private val hold = StateHold()
+    private val mirror = Mirror()
 
     init {
         attachInterface(null, ShellProtocol.TOKEN)
@@ -63,6 +65,7 @@ class DuoShellService : Binder() {
         }
         if (code == SHIZUKU_DESTROY) {
             reader?.stop()
+            mirror.stop()
             hold.release()
             System.exit(0)
             return true
@@ -128,6 +131,23 @@ class DuoShellService : Binder() {
             ShellProtocol.RELEASE_STATE -> {
                 out.writeNoException()
                 out.writeBundle(hold.release())
+            }
+            ShellProtocol.MIRROR_START -> {
+                val src = data.readInt()
+                val identity = clearCallingIdentity()
+                val b = try { mirror.start(src) } finally { restoreCallingIdentity(identity) }
+                out.writeNoException()
+                out.writeBundle(b)
+            }
+            ShellProtocol.MIRROR_STOP -> {
+                out.writeNoException()
+                out.writeBundle(mirror.stop())
+            }
+            ShellProtocol.HANDOVER -> {
+                val coverOnly = data.readInt()
+                mirror.stop()
+                out.writeNoException()
+                out.writeBundle(hold.handover(coverOnly) { mirror.otherLitDisplay(Display.DEFAULT_DISPLAY) })
             }
             else -> return super.onTransact(code, data, reply, flags)
         }
@@ -293,10 +313,18 @@ class DuoShellService : Binder() {
             requestInternal(state)
         }
 
+        /** Bumped per request; a callback only acts for the request that is current. */
+        @Volatile private var generation = 0
+
+        /**
+         * A new override *replaces* the active one in the system (no cancel in
+         * between — cancelling first would drop to the base state for a moment,
+         * which is exactly the double power-cycle we're avoiding).
+         */
         @Synchronized
         private fun requestInternal(state: Int) {
             if (held == state) return
-            if (held >= 0) cancel()
+            val gen = ++generation
             val reqClass = Class.forName("android.hardware.devicestate.DeviceStateRequest")
             val builder = reqClass.getMethod("newBuilder", Integer.TYPE).invoke(null, state)!!
             val request = builder.javaClass.getMethod("build").invoke(builder)
@@ -304,15 +332,15 @@ class DuoShellService : Binder() {
             val callback = java.lang.reflect.Proxy.newProxyInstance(cbClass.classLoader, arrayOf(cbClass)) { proxy, m, args ->
                 when (m.name) {
                     "onRequestActivated", "onRequestSuspended", "onRequestCanceled" -> {
-                        lastEvent = "${m.name}(${args?.firstOrNull()})"
-                        if (m.name == "onRequestCanceled") {
+                        lastEvent = "${m.name}(${args?.firstOrNull()}) gen=$gen"
+                        if (m.name == "onRequestCanceled" && gen == generation) {
                             held = -1
                             // Closing back without the app letting go (base → CLOSED
                             // cancels overrides): put the hold straight back.
                             val want = desired
                             if (want >= 0) Thread {
                                 Thread.sleep(REASSERT_DELAY_MS)
-                                if (desired == want) runCatching { requestInternal(want) }
+                                if (desired == want && generation == gen) runCatching { requestInternal(want) }
                                     .onSuccess { lastEvent = "re-held $want" }
                             }.start()
                         }
@@ -336,7 +364,29 @@ class DuoShellService : Binder() {
             if (held >= 0) cancel()
         }
 
+        /**
+         * Both-panels-lit → normal without the slow path: switching straight
+         * from a dual state power-cycles both panels (~600 ms black). Going to
+         * the cover-only state first keeps display 0 where it is and just turns
+         * the second panel off; once it's gone, releasing is an ordinary swap.
+         */
+        fun handover(coverOnly: Int, secondPanelLit: () -> Int?): Bundle {
+            val t0 = SystemClock.elapsedRealtime()
+            val b = result {
+                desired = coverOnly
+                requestInternal(coverOnly)
+                val deadline = t0 + HANDOVER_WAIT_MS
+                while (secondPanelLit() != null && SystemClock.elapsedRealtime() < deadline) Thread.sleep(10)
+                desired = -1
+                if (held >= 0) cancel()
+            }
+            b.putLong("ms", SystemClock.elapsedRealtime() - t0)
+            return b
+        }
+
+        @Synchronized
         private fun cancel() {
+            generation++ // the cancel callback that follows is ours, not a system drop
             global().javaClass.getMethod("cancelStateRequest").invoke(global())
             held = -1
         }
@@ -353,6 +403,109 @@ class DuoShellService : Binder() {
             }
             putInt("held", held)
             putString("event", lastEvent)
+        }
+    }
+
+    // ---- live mirror onto the second panel ----------------------------------
+
+    /**
+     * While both panels are lit (device state ALL2: cover = display 0, inner =
+     * a second logical display), put a live SurfaceFlinger mirror of display 0
+     * on the other panel's layer stack, scaled to fit and centred — the inner
+     * screen shows the very same content as the cover, frame for frame.
+     */
+    private inner class Mirror {
+        private var sc: SurfaceControl? = null
+        /** Our own root container on the target layer stack; the mirror (offscreen as created) hangs under it. */
+        private var host: SurfaceControl? = null
+        @Volatile var target = -1
+            private set
+
+        private fun dm(): Any = dmService ?: systemService("display", "android.hardware.display.IDisplayManager\$Stub").also { dmService = it }
+        private fun info(id: Int): Any? = runCatching {
+            Class.forName("android.hardware.display.IDisplayManager").getMethod("getDisplayInfo", Integer.TYPE).invoke(dm(), id)
+        }.getOrNull()
+        private fun Any.int(field: String) = javaClass.getField(field).getInt(this)
+
+        /** A lit display other than [source] that has its own layer stack, else null. */
+        fun otherLitDisplay(source: Int): Int? {
+            val ids = runCatching {
+                Class.forName("android.hardware.display.IDisplayManager").getMethod("getDisplayIds", java.lang.Boolean.TYPE)
+                    .invoke(dm(), false) as IntArray
+            }.getOrNull() ?: return null
+            return ids.firstOrNull { id ->
+                id != source && info(id)?.let { it.int("layerStack") >= 0 && it.int("state") != Display.STATE_OFF && it.int("logicalWidth") > 1000 } == true
+            }
+        }
+
+        fun start(source: Int): Bundle = Bundle().apply {
+            try {
+                stop()
+                // The second panel's logical display appears a moment after the state change.
+                val deadline = SystemClock.elapsedRealtime() + MIRROR_WAIT_MS
+                var dst: Int? = otherLitDisplay(source)
+                while (dst == null && SystemClock.elapsedRealtime() < deadline) {
+                    Thread.sleep(10)
+                    dst = otherLitDisplay(source)
+                }
+                if (dst == null) throw IllegalStateException("no second lit display")
+                val src = info(source) ?: throw IllegalStateException("no display $source")
+                val dstInfo = info(dst) ?: throw IllegalStateException("no display $dst")
+                val sw = src.int("logicalWidth").toFloat(); val sh = src.int("logicalHeight").toFloat()
+                val tw = dstInfo.int("logicalWidth").toFloat(); val th = dstInfo.int("logicalHeight").toFloat()
+                val layerStack = dstInfo.int("layerStack")
+
+                val out = SurfaceControl::class.java.getDeclaredConstructor().newInstance()
+                val wm = wmService ?: systemService("window", "android.view.IWindowManager\$Stub").also { wmService = it }
+                val ok = Class.forName("android.view.IWindowManager")
+                    .getMethod("mirrorDisplay", Integer.TYPE, SurfaceControl::class.java).invoke(wm, source, out) as Boolean
+                if (!ok || !out.isValid) throw IllegalStateException("mirrorDisplay($source) failed")
+
+                // WMS hands back an offscreen "MirrorRoot"; a layer stack only
+                // applies to root layers, so make our own root on the target
+                // panel's stack and parent the mirror under it.
+                val builder = SurfaceControl.Builder().setName("DuoMirrorHost")
+                SurfaceControl.Builder::class.java.getMethod("setContainerLayer").invoke(builder) // hidden
+                val root = builder.build()
+                val scale = minOf(tw / sw, th / sh)
+                val t = SurfaceControl.Transaction()
+                SurfaceControl.Transaction::class.java.getMethod("setLayerStack", SurfaceControl::class.java, Integer.TYPE)
+                    .invoke(t, root, layerStack)
+                t.setLayer(root, Int.MAX_VALUE - 100)
+                t.setVisibility(root, true)
+                t.reparent(out, root)
+                t.setScale(out, scale, scale)
+                t.setPosition(out, (tw - sw * scale) / 2f, (th - sh * scale) / 2f)
+                t.setVisibility(out, true)
+                t.apply()
+                host = root
+                sc = out
+                target = dst
+                putBoolean("ok", true)
+                putInt("target", dst)
+                putInt("layerStack", layerStack)
+                putFloat("scale", scale)
+            } catch (t: Throwable) {
+                var c: Throwable = t
+                while (c.cause != null) c = c.cause!!
+                putBoolean("ok", false)
+                putString("error", "${c.javaClass.simpleName}: ${c.message}")
+            }
+        }
+
+        fun stop(): Bundle {
+            sc?.let { s ->
+                runCatching { SurfaceControl.Transaction().setVisibility(s, false).reparent(s, null).apply() }
+                runCatching { s.release() }
+            }
+            host?.let { h ->
+                runCatching { SurfaceControl.Transaction().setVisibility(h, false).reparent(h, null).apply() }
+                runCatching { h.release() }
+            }
+            host = null
+            sc = null
+            target = -1
+            return Bundle().apply { putBoolean("ok", true) }
         }
     }
 
@@ -458,6 +611,8 @@ class DuoShellService : Binder() {
         /** Shizuku asks user services to exit with this code. */
         const val SHIZUKU_DESTROY = 16777115
         const val REASSERT_DELAY_MS = 30L
+        const val MIRROR_WAIT_MS = 600L
+        const val HANDOVER_WAIT_MS = 400L
         val FAMILIES = listOf("android.window.ScreenCaptureInternal", "android.window.ScreenCapture")
     }
 }

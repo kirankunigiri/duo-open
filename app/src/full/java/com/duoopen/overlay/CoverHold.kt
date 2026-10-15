@@ -46,16 +46,48 @@ class CoverHold(
     private var lastAssertMs = 0L
 
     private val profileState: Int? get() = DeviceProfile.current.coverHoldState
+    private val dualState: Int? get() = DeviceProfile.current.dualState
+
+    /** Both panels lit with the cover mirrored onto the inner one (main thread only). */
+    var dual = false
+        private set
+    /** Set by a fresh at-rest reading; a stale angle left over from a close must not light the inner panel. */
+    private var dualArmed = false
 
     private fun enabled(): Boolean =
         profileState != null && DuoSettings.config.value.holdCover && ShizukuBridge.ready
 
+    private fun dualEnabled(): Boolean = dualState != null && DuoSettings.config.value.dualScreen
+
+    private fun releaseAngle(): Float =
+        if (dualEnabled()) DuoSettings.config.value.dualReleaseHinge else DuoSettings.config.value.holdReleaseHinge
+
     /** Re-evaluate on every hinge reading, display change and screen on/off. */
+    /** adb debug: pin the dual state regardless of the hinge until turned off. */
+    private var debugPinned = false
+
     fun update(angle: Float) {
-        val release = DuoSettings.config.value.holdReleaseHinge
+        if (debugPinned) return
+        val release = releaseAngle()
         val coverIsDefault = !innerIsDefault
         val want = enabled() && interactive && coverIsDefault &&
             (angle.isNaN() || angle < release)
+        if (dual) {
+            when {
+                !want && angle.isFinite() && angle >= release -> handover(angle)
+                !want -> exitDual(toHold = false, reason = if (!interactive) "screen off" else "lost the cover")
+                angle.isFinite() && angle <= REASSERT_BELOW_HINGE -> exitDual(toHold = true, reason = "closed again at ${angle.fmt()}°")
+            }
+            return
+        }
+        if (holding && angle.isFinite() && angle <= REASSERT_BELOW_HINGE) dualArmed = true
+        if (want && holding && dualArmed && dualEnabled() && angle.isFinite() &&
+            angle >= DeviceProfile.current.closedHinge + DUAL_ENTER_PAST_CLOSED_DEG
+        ) {
+            dualArmed = false
+            enterDual(angle)
+            return
+        }
         when {
             want && !holding -> hold("cover is display 0 at ${angle.fmt()}°")
             want && holding && angle.isFinite() && angle <= REASSERT_BELOW_HINGE -> {
@@ -79,11 +111,51 @@ class CoverHold(
         }
     }
 
+    /** Leaving closed: light the inner panel too (cover stays display 0, so no swap) and mirror the cover onto it. */
+    private fun enterDual(angle: Float) {
+        val state = dualState ?: return
+        dual = true
+        Log.i(TAG, "dual on at ${angle.fmt()}°: state $state + mirror")
+        worker.execute {
+            val ok = ShizukuBridge.holdState(state)
+            val m = if (ok) ShizukuBridge.startMirror(Display.DEFAULT_DISPLAY) else null
+            handler.post {
+                if (!ok) { Log.w(TAG, "dual state $state failed"); dual = false }
+                else Log.i(TAG, "mirror ${if (m?.getBoolean("ok") == true) "on display ${m.getInt("target")} (layer stack ${m.getInt("layerStack")}, scale ${m.getFloat("scale")})" else "failed: ${m?.getString("error")}"}")
+            }
+        }
+    }
+
+    /** Opened far enough: drop the mirror and hand the screen over to the inner panel, the cheap way. */
+    private fun handover(angle: Float) {
+        val coverOnly = profileState ?: return
+        dual = false
+        holding = false
+        FoldHoldState.coverHeldUntil = Float.NaN
+        FoldHoldState.innerStartHinge = angle
+        Log.i(TAG, "handover at ${angle.fmt()}°")
+        worker.execute { ShizukuBridge.handover(coverOnly) }
+    }
+
+    private fun exitDual(toHold: Boolean, reason: String) {
+        dual = false
+        Log.i(TAG, "dual off: $reason")
+        val coverOnly = profileState
+        worker.execute {
+            ShizukuBridge.stopMirror()
+            if (toHold && coverOnly != null) ShizukuBridge.holdState(coverOnly) else ShizukuBridge.releaseState()
+        }
+        if (!toHold) {
+            holding = false
+            FoldHoldState.coverHeldUntil = Float.NaN
+        }
+    }
+
     private fun hold(reason: String?) {
         val state = profileState ?: return
         holding = true
         lastAssertMs = SystemClock.uptimeMillis()
-        FoldHoldState.coverHeldUntil = DuoSettings.config.value.holdReleaseHinge
+        FoldHoldState.coverHeldUntil = releaseAngle()
         if (reason != null) Log.i(TAG, "hold state $state: $reason")
         worker.execute {
             val ok = ShizukuBridge.holdState(state)
@@ -103,7 +175,14 @@ class CoverHold(
         worker.execute { ShizukuBridge.releaseState() }
     }
 
+    /** adb-only debug hook (see FoldOverlayService): force the dual state + mirror on/off. */
+    fun debugDual(on: Boolean) {
+        if (on && !dual) { debugPinned = true; holding = true; enterDual(Float.NaN) }
+        else if (!on && dual) { debugPinned = false; exitDual(toHold = true, reason = "debug") }
+    }
+
     fun destroy() {
+        if (dual) exitDual(toHold = false, reason = "service stopping")
         if (holding) release("service stopping")
         worker.shutdown()
     }
@@ -115,5 +194,7 @@ class CoverHold(
         /** At or below this the phone is shut; re-assert the hold if the system dropped it. */
         const val REASSERT_BELOW_HINGE = 2f
         const val REASSERT_INTERVAL_MS = 500L
+        /** Light both panels this many degrees past the closed idle. */
+        const val DUAL_ENTER_PAST_CLOSED_DEG = 1f
     }
 }

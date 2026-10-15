@@ -65,7 +65,10 @@ class FoldOverlayService : AccessibilityService() {
 
     /** `adb shell am broadcast -a com.duoopen.DEMO` plays the effect over whatever is on screen. */
     private val demoReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) = playDemo()
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == ACTION_DEBUG_DUAL) coverHold?.debugDual(intent.getBooleanExtra("on", true))
+            else playDemo()
+        }
     }
     private var receiverRegistered = false
 
@@ -76,7 +79,7 @@ class FoldOverlayService : AccessibilityService() {
             // Exported so `adb shell am broadcast` works, but gated on DUMP, which
             // the shell holds and ordinary apps can't — otherwise any app could
             // trigger a capture-and-play.
-            registerReceiver(demoReceiver, IntentFilter(ACTION_DEMO), DEMO_PERMISSION, null, RECEIVER_EXPORTED)
+            registerReceiver(demoReceiver, IntentFilter(ACTION_DEMO).apply { addAction(ACTION_DEBUG_DUAL) }, DEMO_PERMISSION, null, RECEIVER_EXPORTED)
             receiverRegistered = true
         }
         displayManager = getSystemService(DisplayManager::class.java)
@@ -154,7 +157,11 @@ class FoldOverlayService : AccessibilityService() {
         // simulated secondary display stand in for a second panel (see Panels.kt).
         val testDisplays = Settings.Global.getInt(contentResolver, TEST_DISPLAYS_SETTING, 0) != 0
         val defaultName = runCatching { displayManager.getDisplay(Display.DEFAULT_DISPLAY)?.name }.getOrNull()
+        // Devices with a cover-hold state keep display 0 as the only real
+        // panel; the second display a dual state lights carries our mirror.
+        val singleLayout = com.duoopen.fold.DeviceProfile.current.coverHoldState != null
         val live = displayManager.displays
+            .filter { !singleLayout || it.displayId == Display.DEFAULT_DISPLAY }
             .filter { it.isLivePanel(defaultDisplayName = defaultName, includePresentation = testDisplays) }
             .associateBy { it.displayId }
         val gone = engines.keys.filter { it !in live }
@@ -206,6 +213,8 @@ class FoldOverlayService : AccessibilityService() {
     companion object {
         private const val TAG = "DuoOverlay"
         const val ACTION_DEMO = "com.duoopen.DEMO"
+        /** `adb shell am broadcast -a com.duoopen.DEBUG_DUAL --ez on true|false` */
+        const val ACTION_DEBUG_DUAL = "com.duoopen.DEBUG_DUAL"
         private const val TEST_DISPLAYS_SETTING = "duoopen_test_displays"
         private const val DEMO_PERMISSION = "android.permission.DUMP"
         /** How old a panel's last picture may be and still bridge the next fold (kept in memory only). */
