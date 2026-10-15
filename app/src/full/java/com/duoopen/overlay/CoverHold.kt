@@ -66,8 +66,21 @@ class CoverHold(
     /** adb debug: pin the dual state regardless of the hinge until turned off. */
     private var debugPinned = false
 
+    private var lastAngle = Float.NaN
+
     fun update(angle: Float) {
         if (debugPinned) return
+        val falling = angle.isFinite() && lastAngle.isFinite() && angle < lastAngle - 0.3f
+        if (angle.isFinite()) lastAngle = angle
+        // Closing on the inner panel: take the cover early, so the swap's
+        // black happens while the phone is still folding and the cover is
+        // already lit when it shuts (the system would wait until ~4–14°).
+        if (innerIsDefault && !holding && enabled() && interactive && falling &&
+            angle < DuoSettings.config.value.closeHandoverHinge
+        ) {
+            hold("closing: hand over to the cover at ${angle.fmt()}°")
+            return
+        }
         val release = releaseAngle()
         val coverIsDefault = !innerIsDefault
         val want = enabled() && interactive && coverIsDefault &&

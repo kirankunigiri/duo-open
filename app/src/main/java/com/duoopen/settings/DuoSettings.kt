@@ -46,6 +46,10 @@ import kotlinx.coroutines.flow.asStateFlow
  * @param mirrorAlign Where the cover's mirror sits on the inner panel while both
  *   are lit: +1 = right edge (behind the cover on a book fold), 0 = centred,
  *   −1 = left edge.
+ * @param shellRender With Shizuku authorised, draw the effect from the shell
+ *   helper straight into SurfaceFlinger instead of an overlay window.
+ * @param closeHandoverHinge Closing with the cover hold on: hand the screen to the
+ *   cover at this angle on the way down, so it's lit before the phone is shut.
  * @param imageVersion Bumped whenever the wallpaper image changes.
  */
 data class DuoConfig(
@@ -65,6 +69,8 @@ data class DuoConfig(
     val dualScreen: Boolean = true,
     val dualReleaseHinge: Float = 165f,
     val mirrorAlign: Int = 1,
+    val shellRender: Boolean = true,
+    val closeHandoverHinge: Float = 40f,
     val imageVersion: Long = 0L,
 )
 
@@ -95,6 +101,8 @@ object DuoSettings {
             dualScreen = prefs.getBoolean("dualScreen", d.dualScreen),
             dualReleaseHinge = prefs.getFloat("dualReleaseHinge", d.dualReleaseHinge),
             mirrorAlign = prefs.getInt("mirrorAlign", d.mirrorAlign),
+            shellRender = prefs.getBoolean("shellRender", d.shellRender),
+            closeHandoverHinge = prefs.getFloat("closeHandoverHinge", d.closeHandoverHinge),
             imageVersion = prefs.getLong("imageVersion", d.imageVersion),
         )
     }
@@ -120,6 +128,8 @@ object DuoSettings {
             putBoolean("dualScreen", next.dualScreen)
             putFloat("dualReleaseHinge", next.dualReleaseHinge)
             putInt("mirrorAlign", next.mirrorAlign)
+            putBoolean("shellRender", next.shellRender)
+            putFloat("closeHandoverHinge", next.closeHandoverHinge)
             putLong("imageVersion", next.imageVersion)
         }
     }
@@ -139,6 +149,8 @@ object DuoSettings {
             dualScreen = it.dualScreen,
             dualReleaseHinge = it.dualReleaseHinge,
             mirrorAlign = it.mirrorAlign,
+            shellRender = it.shellRender,
+            closeHandoverHinge = it.closeHandoverHinge,
             imageVersion = it.imageVersion,
         )
     }

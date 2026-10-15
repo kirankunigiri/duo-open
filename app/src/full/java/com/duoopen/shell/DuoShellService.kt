@@ -53,6 +53,15 @@ class DuoShellService : Binder() {
     private var reader: AngleReader? = null
     private val hold = StateHold()
     private val mirror = Mirror()
+    private val renderers = HashMap<Int, ShellRenderer>()
+
+    private fun renderer(id: Int): ShellRenderer = synchronized(renderers) {
+        renderers.getOrPut(id) {
+            ShellRenderer(id, ::captureHardware) {
+                synchronized(renderers) { renderers.values.mapNotNull { it.layer }.toTypedArray() }
+            }
+        }
+    }
 
     init {
         attachInterface(null, ShellProtocol.TOKEN)
@@ -66,6 +75,7 @@ class DuoShellService : Binder() {
         if (code == SHIZUKU_DESTROY) {
             reader?.stop()
             mirror.stop()
+            synchronized(renderers) { renderers.values.forEach { it.destroy() } }
             hold.release()
             System.exit(0)
             return true
@@ -74,6 +84,14 @@ class DuoShellService : Binder() {
         val caller = getCallingUid()
         if (owner < 0) owner = caller
         if (caller != owner) throw SecurityException("wrong caller")
+        if (code == ShellProtocol.RENDER_PARAMS) {
+            val id = data.readInt()
+            val visible = data.readInt() != 0
+            val alpha = data.readFloat()
+            val values = FloatArray(ShellRenderer.UNIFORM_COUNT) { data.readFloat() }
+            renderer(id).update(visible, alpha, values)
+            return true
+        }
         val out = reply ?: return false
         when (code) {
             ShellProtocol.PING -> {
@@ -131,6 +149,30 @@ class DuoShellService : Binder() {
             ShellProtocol.RELEASE_STATE -> {
                 out.writeNoException()
                 out.writeBundle(hold.release())
+            }
+            ShellProtocol.RENDER_SETUP -> {
+                val id = data.readInt()
+                val setup = ShellRenderer.Setup(
+                    layerStack = data.readInt(),
+                    sourceDisplay = data.readInt(),
+                    bufferW = data.readInt(),
+                    bufferH = data.readInt(),
+                    x = data.readFloat(),
+                    y = data.readFloat(),
+                    scale = data.readFloat(),
+                    z = data.readInt(),
+                    content = android.graphics.RectF(data.readFloat(), data.readFloat(), data.readFloat(), data.readFloat()),
+                    captureScale = data.readFloat(),
+                    shaderSource = data.readString() ?: "",
+                )
+                val identity = clearCallingIdentity()
+                val ok = try { renderer(id).configure(setup) } finally { restoreCallingIdentity(identity) }
+                out.writeNoException()
+                out.writeBundle(Bundle().apply { putBoolean("ok", ok) })
+            }
+            ShellProtocol.RENDER_HIDE -> {
+                renderer(data.readInt()).hide()
+                out.writeNoException()
             }
             ShellProtocol.MIRROR_START -> {
                 val src = data.readInt()
@@ -206,6 +248,17 @@ class DuoShellService : Binder() {
             }
         }
         throw ClassNotFoundException("no compatible display capture API: $errors")
+    }
+
+    /** In-process zero-copy capture for the renderers; null on failure or secure content. */
+    private fun captureHardware(displayId: Int, excluded: Array<SurfaceControl>, scale: Float): Pair<HardwareBuffer, android.graphics.ColorSpace?>? {
+        val b = runCatching { capture(displayId, excluded, scale, hardware = true) }.getOrNull() ?: return null
+        @Suppress("DEPRECATION")
+        val buffer = b.getParcelable("buffer") as? HardwareBuffer ?: return null
+        if (b.getBoolean("secure")) { buffer.close(); return null }
+        val id = b.getInt("colorSpace", -1)
+        val cs = android.graphics.ColorSpace.Named.entries.asSequence().map { android.graphics.ColorSpace.get(it) }.firstOrNull { it.id == id }
+        return buffer to cs
     }
 
     private var wmService: Any? = null

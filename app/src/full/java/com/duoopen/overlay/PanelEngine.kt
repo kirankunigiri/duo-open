@@ -244,7 +244,8 @@ class PanelEngine(
                 // The fresh panel may still be lighting up: retry if black.
                 startEffect(afterSwap = true)
             }
-            restArmed && (tilt >= REST_LEAVE_TILT || heldCoverLeavingRest(angle)) -> {
+            restArmed && (tilt >= REST_LEAVE_TILT || heldCoverLeavingRest(angle) ||
+                (innerPanel && angle <= DuoShader.FLAT_HINGE - INNER_LEAVE_FLAT_DEG)) -> {
                 restArmed = false
                 Log.i(TAG, "display $displayId: leaving rest (inner=$inner) at hinge=$angle")
                 startEffect(afterSwap = false)
@@ -261,13 +262,16 @@ class PanelEngine(
         !innerPanel && com.duoopen.fold.FoldHoldState.coverHeldUntil.isFinite() &&
             angle >= DuoShader.CLOSED_HINGE + HELD_LEAVE_REST_DEG
 
+    /** The Shizuku helper draws the effect itself (no window, no capture here). */
+    private fun shellMode(): Boolean = DuoSettings.config.value.shellRender && ShizukuBridge.ready
+
     /** Live blur needs no capture: the system blurs whatever is on screen. */
     private fun liveMode(): Boolean =
         DuoSettings.config.value.liveBlur &&
             runCatching { windowManager.isCrossWindowBlurEnabled }.getOrDefault(false)
 
     private fun startEffect(afterSwap: Boolean, startTilt: Float? = null) {
-        if (liveMode()) {
+        if (shellMode() || liveMode()) {
             phase = Phase.CAPTURING // same gate as a capture in flight, resolved synchronously
             present(bitmap = null, afterSwap = afterSwap, startTilt = startTilt, t0 = SystemClock.uptimeMillis())
             return
@@ -465,10 +469,11 @@ class PanelEngine(
         // A cover lit alongside the inner panel keeps hearing the hinge.
         val easeTo = when {
             coarse -> peak
-            afterSwap && !innerPanel && !concurrentCover() && live -> 0f
+            afterSwap && !innerPanel && !concurrentCover() && live && !heldCover() -> 0f
             else -> null
         }
-        val how = if (bitmap != null) "${bitmap.width}x${bitmap.height} snapshot (capture ${SystemClock.uptimeMillis() - t0}ms)" else "live blur"
+        val how = if (bitmap != null) "${bitmap.width}x${bitmap.height} snapshot (capture ${SystemClock.uptimeMillis() - t0}ms)"
+            else if (shellMode()) "shell renderer" else "live blur"
         Log.i(TAG, "display $displayId: showing $how at tilt=$tilt${easeTo?.let { " easing to $it" } ?: ""}${if (bitmap != null && shellCapture()) " [shizuku]" else ""}")
         show(bitmap, tilt, fadeIn = afterSwap, easeTo = easeTo)
     }
@@ -505,6 +510,19 @@ class PanelEngine(
         val foldLine = { w: Float, h: Float, c: com.duoopen.settings.DuoConfig -> DuoShader.foldFor(inner, w, h, c) }
         val created: FoldSurface? = if (bitmap != null) {
             SnapshotSurface(service, windowManager, bitmap, config, foldLine).takeIf { it.attached }
+        } else if (shellMode()) {
+            val bounds = windowManager.maximumWindowMetrics.bounds
+            ShellSurface(
+                rendererId = SHELL_RENDERER_MAIN,
+                layerStack = displayId, // display 0 draws on layer stack 0
+                sourceDisplay = displayId,
+                width = bounds.width(),
+                height = bounds.height(),
+                config = config,
+                pxPerMm = DuoShader.pxPerMm(service.createDisplayContext(display)),
+                foldLine = foldLine,
+                shaderSource = ShellSurface.shaderSource(service),
+            ).takeIf { it.attached }
         } else {
             LiveBlurSurface(service, windowManager, config, DuoShader.pxPerMm(service.createDisplayContext(display)), foldLine)
                 .takeIf { it.attached }
@@ -682,6 +700,9 @@ class PanelEngine(
         const val CLOSE_FINISH_TAU_S = 0.05f
         /** Held cover: leave rest this many degrees past the closed idle. */
         const val HELD_LEAVE_REST_DEG = 1f
+        /** Inner panel: start closing this many degrees below the flat rest. */
+        const val INNER_LEAVE_FLAT_DEG = 2f
+        const val SHELL_RENDERER_MAIN = 0
         const val SETTLE_TIMEOUT_MS = 700L
         const val FADE_IN_MS = 140L
         const val FADE_OUT_FLAT_MS = 120L

@@ -28,6 +28,15 @@ object ShellProtocol {
      * the second panel switches off), then release so the normal swap follows.
      */
     const val HANDOVER = 10
+    /**
+     * in: id, layerStack, sourceDisplay, bufferW, bufferH, x, y, scale, z,
+     * contentL, contentT, contentR, contentB, captureScale, shaderSource → Bundle{ok, error}
+     */
+    const val RENDER_SETUP = 11
+    /** ONE-WAY. in: id, visible(int), alpha, float[UNIFORM_COUNT] */
+    const val RENDER_PARAMS = 12
+    /** in: id → hides (keeps the layer for the next fold) */
+    const val RENDER_HIDE = 13
 
     /** callback: float angle, long uptimeMs */
     const val CB_ANGLE = 1

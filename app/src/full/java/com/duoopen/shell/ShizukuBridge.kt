@@ -239,6 +239,38 @@ object ShizukuBridge {
     fun handover(coverOnlyState: Int): Bundle? = call(ShellProtocol.HANDOVER) { it.writeInt(coverOnlyState) }
         ?.also { Log.i(TAG, "handover ok=${it.getBoolean("ok")} in ${it.getLong("ms")} ms ${it.getString("error") ?: ""}") }
 
+    class RenderSetup(
+        val layerStack: Int, val sourceDisplay: Int, val bufferW: Int, val bufferH: Int,
+        val x: Float, val y: Float, val scale: Float, val z: Int,
+        val content: android.graphics.RectF, val captureScale: Float, val shaderSource: String,
+    )
+
+    /** Creates or reconfigures shell renderer [id] (blocking, once per fold at most). */
+    fun renderSetup(id: Int, s: RenderSetup): Boolean = call(ShellProtocol.RENDER_SETUP) { p ->
+        p.writeInt(id); p.writeInt(s.layerStack); p.writeInt(s.sourceDisplay); p.writeInt(s.bufferW); p.writeInt(s.bufferH)
+        p.writeFloat(s.x); p.writeFloat(s.y); p.writeFloat(s.scale); p.writeInt(s.z)
+        p.writeFloat(s.content.left); p.writeFloat(s.content.top); p.writeFloat(s.content.right); p.writeFloat(s.content.bottom)
+        p.writeFloat(s.captureScale); p.writeString(s.shaderSource)
+    }?.getBoolean("ok") == true
+
+    /** One-way: never blocks the caller (main thread, every frame). */
+    fun renderParams(id: Int, visible: Boolean, alpha: Float, values: FloatArray) {
+        val binder = service ?: return
+        val p = Parcel.obtain()
+        try {
+            p.writeInterfaceToken(ShellProtocol.TOKEN)
+            p.writeInt(id); p.writeInt(if (visible) 1 else 0); p.writeFloat(alpha)
+            values.forEach { p.writeFloat(it) }
+            binder.transact(ShellProtocol.RENDER_PARAMS, p, null, IBinder.FLAG_ONEWAY)
+        } catch (e: Exception) {
+            Log.w(TAG, "renderParams: $e")
+        } finally {
+            p.recycle()
+        }
+    }
+
+    fun renderHide(id: Int) { call(ShellProtocol.RENDER_HIDE) { it.writeInt(id) } }
+
     fun releaseState(): Boolean {
         val b = call(ShellProtocol.RELEASE_STATE) ?: return false
         if (!b.getBoolean("ok")) Log.w(TAG, "release state failed: ${b.getString("error")}")
