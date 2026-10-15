@@ -1,0 +1,119 @@
+package com.duoopen.overlay
+
+import android.content.Context
+import android.hardware.display.DisplayManager
+import android.os.Handler
+import android.os.PowerManager
+import android.os.SystemClock
+import android.util.Log
+import android.view.Display
+import com.duoopen.fold.DeviceProfile
+import com.duoopen.fold.FoldHoldState
+import com.duoopen.fold.isInnerPanel
+import com.duoopen.settings.DuoSettings
+import com.duoopen.shell.ShizukuBridge
+import java.util.concurrent.Executors
+
+/**
+ * Keeps the cover lit while the phone opens, so the cover's half of the fold
+ * actually plays. On the OPPO Find N6 the system swaps display 0 to the inner
+ * panel ~10° into an open; overriding the device state to the cover-only one
+ * (same layout as CLOSED) while closed means opening changes nothing until we
+ * let go at [com.duoopen.settings.DuoConfig.holdReleaseHinge] — then the usual
+ * swap happens there.
+ *
+ * Holds only while the screen is on: with the screen off, opening must still
+ * reach OPENED, which is what wakes the phone. The override lives in the
+ * Shizuku shell process, which dies with the app, so a crash can't leave the
+ * phone stuck on the cover.
+ */
+class CoverHold(
+    context: Context,
+    private val handler: Handler,
+) {
+    private val power = context.getSystemService(PowerManager::class.java)
+    private val displays = context.getSystemService(DisplayManager::class.java)
+    private val worker = Executors.newSingleThreadExecutor { Thread(it, "duo-cover-hold") }
+
+    /** Screen on/off, kept from broadcasts so hinge events cost no binder call. */
+    var interactive: Boolean = power?.isInteractive == true
+    /** Whether display 0 currently shows the inner panel; pushed from display-change events. */
+    var innerIsDefault: Boolean = displays.getDisplay(Display.DEFAULT_DISPLAY).isInnerPanel()
+
+    /** What we last asked the shell for (main thread only). */
+    var holding = false
+        private set
+    private var lastAssertMs = 0L
+
+    private val profileState: Int? get() = DeviceProfile.current.coverHoldState
+
+    private fun enabled(): Boolean =
+        profileState != null && DuoSettings.config.value.holdCover && ShizukuBridge.ready
+
+    /** Re-evaluate on every hinge reading, display change and screen on/off. */
+    fun update(angle: Float) {
+        val release = DuoSettings.config.value.holdReleaseHinge
+        val coverIsDefault = !innerIsDefault
+        val want = enabled() && interactive && coverIsDefault &&
+            (angle.isNaN() || angle < release)
+        when {
+            want && !holding -> hold("cover is display 0 at ${angle.fmt()}°")
+            want && holding && angle.isFinite() && angle <= REASSERT_BELOW_HINGE -> {
+                // Closing back without reaching the release angle returns the
+                // base state to CLOSED, which cancels overrides; ask again.
+                val now = SystemClock.uptimeMillis()
+                if (now - lastAssertMs >= REASSERT_INTERVAL_MS) hold(null)
+            }
+            !want && holding -> release(
+                when {
+                    angle.isFinite() && angle >= release -> "reached ${angle.fmt()}° (release at ${release.fmt()}°)"
+                    !interactive -> "screen off"
+                    !coverIsDefault -> "inner is display 0"
+                    else -> "disabled"
+                },
+                handedOverAt = if (angle.isFinite() && angle >= release) angle else Float.NaN,
+            )
+        }
+        if (!holding && coverIsDefault && angle.isFinite() && angle <= REASSERT_BELOW_HINGE) {
+            FoldHoldState.innerStartHinge = Float.NaN // closed again: next open starts fresh
+        }
+    }
+
+    private fun hold(reason: String?) {
+        val state = profileState ?: return
+        holding = true
+        lastAssertMs = SystemClock.uptimeMillis()
+        FoldHoldState.coverHeldUntil = DuoSettings.config.value.holdReleaseHinge
+        if (reason != null) Log.i(TAG, "hold state $state: $reason")
+        worker.execute {
+            val ok = ShizukuBridge.holdState(state)
+            if (!ok) handler.post {
+                Log.w(TAG, "hold state $state failed")
+                holding = false
+                FoldHoldState.coverHeldUntil = Float.NaN
+            }
+        }
+    }
+
+    private fun release(reason: String, handedOverAt: Float = Float.NaN) {
+        holding = false
+        FoldHoldState.coverHeldUntil = Float.NaN
+        if (handedOverAt.isFinite()) FoldHoldState.innerStartHinge = handedOverAt
+        Log.i(TAG, "release: $reason")
+        worker.execute { ShizukuBridge.releaseState() }
+    }
+
+    fun destroy() {
+        if (holding) release("service stopping")
+        worker.shutdown()
+    }
+
+    private fun Float.fmt() = "%.1f".format(this)
+
+    private companion object {
+        const val TAG = "DuoHold"
+        /** At or below this the phone is shut; re-assert the hold if the system dropped it. */
+        const val REASSERT_BELOW_HINGE = 2f
+        const val REASSERT_INTERVAL_MS = 500L
+    }
+}

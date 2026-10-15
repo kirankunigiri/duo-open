@@ -17,6 +17,7 @@ import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityManager
 import com.duoopen.fold.HingeAngleSource
+import com.duoopen.fold.isInnerPanel
 import com.duoopen.fold.isLivePanel
 import com.duoopen.settings.DuoSettings
 import com.duoopen.shell.ShizukuBridge
@@ -47,6 +48,14 @@ class FoldOverlayService : AccessibilityService() {
     private val engines = LinkedHashMap<Int, PanelEngine>()
     private val snapshots = SnapshotCache(maxAgeMs = SNAPSHOT_MAX_AGE_MS)
     private var angleFeed: WallpaperAngleFeed? = null
+    private var coverHold: CoverHold? = null
+
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            coverHold?.interactive = intent.action != Intent.ACTION_SCREEN_OFF
+            coverHold?.update(hinge.lastAngle)
+        }
+    }
 
     private val displayListener = object : DisplayManager.DisplayListener {
         override fun onDisplayAdded(displayId: Int) = syncDisplays()
@@ -75,9 +84,18 @@ class FoldOverlayService : AccessibilityService() {
         hinge = HingeAngleSource(this) { onHinge(it) }
         hinge.start()
         ShizukuBridge.init(this)
+        coverHold = CoverHold(this, handler)
+        registerReceiver(screenReceiver, IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }, RECEIVER_NOT_EXPORTED)
+        scope.launch { ShizukuBridge.state.collect { coverHold?.update(hinge.lastAngle) } }
+        scope.launch { DuoSettings.config.collect { coverHold?.update(hinge.lastAngle) } }
         angleFeed = WallpaperAngleFeed(this, handler, hinge)
         scope.launch { ShizukuBridge.state.collect { syncAngleFeed() } }
         scope.launch { DuoSettings.config.collect { syncAngleFeed() } }
+        handler.post(stallTick)
         syncDisplays()
         Log.i(TAG, "connected; hinge=${hinge.sensor?.name} live displays=${engines.keys}")
     }
@@ -85,6 +103,10 @@ class FoldOverlayService : AccessibilityService() {
     override fun onDestroy() {
         instance = null
         angleFeed?.stop()
+        handler.removeCallbacks(stallTick)
+        coverHold?.destroy()
+        coverHold = null
+        runCatching { unregisterReceiver(screenReceiver) }
         if (receiverRegistered) unregisterReceiver(demoReceiver)
         hinge.stop()
         displayManager.unregisterDisplayListener(displayListener)
@@ -98,17 +120,31 @@ class FoldOverlayService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
     override fun onInterrupt() = Unit
 
-    private var lastHingeSyncMs = 0L
+
+    // Main-thread stall monitor (instrumentation): a 50 ms tick; report the
+    // worst lateness each 2 s window if anything was over a frame or two.
+    private var stallExpected = 0L
+    private var stallWorst = 0L
+    private var stallWindowStart = 0L
+    private val stallTick = object : Runnable {
+        override fun run() {
+            val now = SystemClock.uptimeMillis()
+            if (stallExpected > 0L) stallWorst = maxOf(stallWorst, now - stallExpected)
+            if (now - stallWindowStart >= 2_000L) {
+                if (stallWorst > 25L) Log.i(TAG, "main thread stalled up to ${stallWorst} ms in the last 2 s")
+                stallWorst = 0L
+                stallWindowStart = now
+            }
+            stallExpected = now + 50L
+            handler.postDelayed(this, 50L)
+        }
+    }
 
     private fun onHinge(angle: Float) {
-        // The hinge reports ~50 Hz mid-fold and each sync is several binder
-        // calls on the main thread; display changes arrive through the
-        // listener anyway, so a periodic re-check is plenty here.
-        val now = SystemClock.uptimeMillis()
-        if (now - lastHingeSyncMs >= HINGE_SYNC_INTERVAL_MS) {
-            lastHingeSyncMs = now
-            syncDisplays()
-        }
+        // No display queries here: they're binder calls on the main thread
+        // (~50 Hz mid-fold), and panel changes arrive through the display
+        // listener anyway.
+        coverHold?.update(angle)
         for (e in engines.values.toList()) e.onHinge(angle)
     }
 
@@ -140,8 +176,11 @@ class FoldOverlayService : AccessibilityService() {
             }
         }
         if (gone.isNotEmpty()) updateRunning()
-        for (e in engines.values.toList()) e.evaluate()
+        for (e in engines.values.toList()) e.evaluate(readDisplay = true)
         angleFeed?.onDisplayChanged()
+        coverHold?.innerIsDefault = live[Display.DEFAULT_DISPLAY]?.let { it.isInnerPanel() }
+            ?: coverHold?.innerIsDefault ?: false
+        if (::hinge.isInitialized) coverHold?.update(hinge.lastAngle)
     }
 
     /** Samsung continuous angle via Shizuku + fold wallpaper, when everything lines up. */
@@ -171,7 +210,6 @@ class FoldOverlayService : AccessibilityService() {
         private const val DEMO_PERMISSION = "android.permission.DUMP"
         /** How old a panel's last picture may be and still bridge the next fold (kept in memory only). */
         private const val SNAPSHOT_MAX_AGE_MS = 3 * 60_000L
-        private const val HINGE_SYNC_INTERVAL_MS = 50L
 
         /** The connected service, for in-process control from the app. */
         @Volatile

@@ -14,6 +14,10 @@ object ShellProtocol {
     const val STOP_ANGLES = 4
     /** → Bundle{state, lines, parsed, rejected, last, angle} */
     const val ANGLE_STATUS = 5
+    /** in: device state id → Bundle{ok, error}; overrides the device state until released or this process dies */
+    const val HOLD_STATE = 6
+    /** → Bundle{ok, error}; cancels a [HOLD_STATE] override */
+    const val RELEASE_STATE = 7
 
     /** callback: float angle, long uptimeMs */
     const val CB_ANGLE = 1

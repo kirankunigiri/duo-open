@@ -34,6 +34,24 @@ class HingeAngleSource(
     private val onAngle: (Float) -> Unit,
 ) : SensorEventListener {
 
+    /*
+     * Sensor events arrive on their own thread and only the newest reading is
+     * handed to the main thread: if the main thread is busy for a moment, the
+     * fold catches up to where the hinge *is* instead of replaying a backlog
+     * of stale angles (which read as the effect lagging far behind the hand).
+     */
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    /** Latest unconsumed reading per sensor (the public and vendor sensors may both report). */
+    private val pendingValues = java.util.concurrent.ConcurrentHashMap<Sensor, Float>()
+    private val drainPosted = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val drain = Runnable {
+        drainPosted.set(false)
+        for (sensor in pendingValues.keys.toList()) {
+            val value = pendingValues.remove(sensor) ?: continue
+            deliver(sensor, value)
+        }
+    }
+
     private class Stats(val sensor: Sensor) {
         var events = 0
         var last = Float.NaN
@@ -178,7 +196,7 @@ class HingeAngleSource(
             // needs com.samsung.permission.SSENSOR); that throws instead of
             // returning false.
             c.registered = try {
-                sm.registerListener(this, c.sensor, SAMPLING_PERIOD_US)
+                sm.registerListener(this, c.sensor, SAMPLING_PERIOD_US, sensorHandler)
             } catch (e: SecurityException) {
                 Log.w(TAG, "register denied for ${c.sensor.name}: ${e.message}")
                 false
@@ -191,12 +209,39 @@ class HingeAngleSource(
         if (!started) return
         started = false
         sensorManager?.unregisterListener(this)
+        mainHandler.removeCallbacks(drain)
+        drainPosted.set(false)
+        pendingValues.clear()
         for (c in candidates) c.registered = false
     }
 
+    // Latency instrumentation: sensor timestamp → callback, per 25 events.
+    private var latSum = 0.0
+    private var latMax = 0.0
+    private var latN = 0
+
+    /** Sensor thread: keep only the latest reading and wake the main thread once. */
     override fun onSensorChanged(event: SensorEvent) {
         val value = event.values.firstOrNull() ?: return
-        val stats = candidates.firstOrNull { it.sensor == event.sensor } ?: return
+        logLatency(event)
+        pendingValues[event.sensor] = value
+        if (drainPosted.compareAndSet(false, true)) mainHandler.post(drain)
+    }
+
+    private fun logLatency(event: SensorEvent) {
+        val latencyMs = (SystemClock.elapsedRealtimeNanos() - event.timestamp) / 1e6
+        latSum += latencyMs
+        if (latencyMs > latMax) latMax = latencyMs
+        if (++latN >= 25) {
+            Log.i(TAG, "latency ${event.sensor.name.trim()}: avg %.1f ms, max %.1f ms over $latN events (thread=${Thread.currentThread().name})"
+                .format(latSum / latN, latMax))
+            latSum = 0.0; latMax = 0.0; latN = 0
+        }
+    }
+
+    /** Main thread. */
+    private fun deliver(sensor: Sensor, value: Float) {
+        val stats = candidates.firstOrNull { it.sensor == sensor } ?: return
         // An external continuous source wins while it's alive; if it goes
         // quiet the sensors take over again.
         if (externalActive) {
@@ -277,6 +322,12 @@ class HingeAngleSource(
     }
 
     private companion object {
+        /** One shared sensor thread for every instance (overlay, app UI, wallpaper). */
+        val sensorHandler: android.os.Handler by lazy {
+            val t = android.os.HandlerThread("duo-hinge", android.os.Process.THREAD_PRIORITY_DISPLAY)
+            t.start()
+            android.os.Handler(t.looper)
+        }
         const val TAG = "DuoHinge"
         /** ~125 Hz ceiling; the sensors only report on change anyway. */
         const val SAMPLING_PERIOD_US = 8_000

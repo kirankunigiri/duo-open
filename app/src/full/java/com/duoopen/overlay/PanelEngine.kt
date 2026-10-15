@@ -133,10 +133,63 @@ class PanelEngine(
 
     private fun currentTilt(): Float = tiltFor(hinge.lastAngle)
 
+    /** Hinge speed in °/s (smoothed), for prediction and the close extrapolation. */
+    private var hingeVelocity = 0f
+    private var lastSampleAngle = Float.NaN
+    private var lastSampleMs = 0L
+
+    private fun trackVelocity(angle: Float, now: Long) {
+        if (lastSampleAngle.isFinite() && lastSampleMs > 0L) {
+            val dt = (now - lastSampleMs) / 1000f
+            if (dt in 0.004f..0.2f) {
+                val v = (angle - lastSampleAngle) / dt
+                hingeVelocity += (v - hingeVelocity) * VELOCITY_SMOOTHING
+            } else if (dt > 0.2f) {
+                hingeVelocity = 0f
+            }
+        }
+        lastSampleAngle = angle
+        lastSampleMs = now
+    }
+
+    /**
+     * The sensor (~50 Hz, ~20 ms old) plus the follower's ease leave the frost
+     * a few degrees behind the hand; aim [PREDICT_S] ahead along the current
+     * speed to cancel most of it. Only while clearly moving.
+     */
+    private fun predicted(angle: Float): Float =
+        if (kotlin.math.abs(hingeVelocity) < PREDICT_MIN_SPEED) angle
+        else (angle + hingeVelocity * PREDICT_S).coerceIn(0f, 180f)
+
+    private fun heldCover(): Boolean = !innerPanel && com.duoopen.fold.FoldHoldState.coverHeldUntil.isFinite()
+
+    /**
+     * Closing onto a held cover, the hinge sensor goes quiet in the last
+     * degrees (the magnets snap it shut), which used to leave the frost hanging
+     * until the 0.7 s stall check. If it's falling fast near closed and then
+     * goes silent, finish the close ourselves.
+     */
+    private val closeExtrapolation = Runnable {
+        val f = follower ?: return@Runnable
+        if (phase != Phase.SHOWING || timedResolve || demoRunning) return@Runnable
+        if (SystemClock.uptimeMillis() - lastHingeMoveMs < CLOSE_QUIET_MS) return@Runnable
+        Log.i(TAG, "display $displayId: hinge quiet at ${lastSampleAngle}° while closing; finishing the close")
+        f.tauS = CLOSE_FINISH_TAU_S
+        f.setTarget(0f)
+        restArmed = true // the reading is stale; the phone is shut, so the next open starts fresh
+    }
+
     fun onHinge(angle: Float) {
-        lastHingeMoveMs = SystemClock.uptimeMillis()
+        val now = SystemClock.uptimeMillis()
+        lastHingeMoveMs = now
+        trackVelocity(angle, now)
         evaluate()
-        val tilt = tiltFor(angle)
+        handler.removeCallbacks(closeExtrapolation)
+        if (heldCover() && phase == Phase.SHOWING && angle < CLOSE_EXTRAPOLATE_BELOW && hingeVelocity < -PREDICT_MIN_SPEED) {
+            handler.postDelayed(closeExtrapolation, CLOSE_QUIET_MS)
+        }
+        follower?.let { if (!timedResolve) it.tauS = TiltFollower.DEFAULT_TAU_S }
+        val tilt = tiltFor(predicted(angle))
         if (tilt < DuoShader.FLAT_EPSILON && phase == Phase.SHOWING && !demoRunning) {
             val f = follower
             if (timedResolve && hinge.isCoarse && f != null && f.current > DuoShader.FLAT_EPSILON) {
@@ -162,9 +215,13 @@ class PanelEngine(
      * the first panel and frost-down on the second. A capture starts on
      * leaving rest and again on each swap.
      */
-    fun evaluate() {
+    /** Last panel kind read from the display; refreshed on display changes only (it's a binder read). */
+    private var displayInner = innerPanel
+
+    fun evaluate(readDisplay: Boolean = false) {
         if (demoRunning) return
-        val inner = display.isInnerPanel()
+        if (readDisplay) displayInner = display.isInnerPanel()
+        val inner = displayInner
         if (inner != innerPanel) {
             innerPanel = inner
             panelSwitched = true
@@ -187,13 +244,22 @@ class PanelEngine(
                 // The fresh panel may still be lighting up: retry if black.
                 startEffect(afterSwap = true)
             }
-            restArmed && tilt >= REST_LEAVE_TILT -> {
+            restArmed && (tilt >= REST_LEAVE_TILT || heldCoverLeavingRest(angle)) -> {
                 restArmed = false
                 Log.i(TAG, "display $displayId: leaving rest (inner=$inner) at hinge=$angle")
                 startEffect(afterSwap = false)
             }
         }
     }
+
+    /**
+     * While the cover is held lit (see CoverHold) its frost is spread over
+     * ~90° of hinge, so a 3° tilt threshold would only fire ~8–20° in. Start
+     * from the hinge instead, a degree past the closed idle.
+     */
+    private fun heldCoverLeavingRest(angle: Float): Boolean =
+        !innerPanel && com.duoopen.fold.FoldHoldState.coverHeldUntil.isFinite() &&
+            angle >= DuoShader.CLOSED_HINGE + HELD_LEAVE_REST_DEG
 
     /** Live blur needs no capture: the system blurs whatever is on screen. */
     private fun liveMode(): Boolean =
@@ -498,27 +564,37 @@ class PanelEngine(
         liveLoop = true
         val myGen = captureGen
         var frames = 0
+        // Zero-copy frames pin compositor buffers until released. The one on
+        // screen (and the one before it) may still be in a display list the
+        // RenderThread is drawing, so only release frames three back.
+        val retired = ArrayDeque<android.graphics.Bitmap>()
+        fun retire(b: android.graphics.Bitmap) {
+            retired.addLast(b)
+            while (retired.size > 3) retired.removeFirst().let { if (it.config == android.graphics.Bitmap.Config.HARDWARE) it.recycle() }
+        }
         fun tick() {
             if (!liveLoop || phase != Phase.SHOWING || myGen != captureGen) { liveLoop = false; return }
             val s = surface as? SnapshotSurface
-            if (s == null || s.tilt < DuoShader.FLAT_EPSILON) { handler.postDelayed({ tick() }, LIVE_INTERVAL_MS); return }
+            if (s == null || s.tilt < DuoShader.FLAT_EPSILON) { handler.postDelayed({ tick() }, LIVE_IDLE_POLL_MS); return }
             val excluded = excludedLayers()
-            if (excluded.isEmpty()) { handler.postDelayed({ tick() }, LIVE_INTERVAL_MS); return }
+            if (excluded.isEmpty()) { handler.postDelayed({ tick() }, LIVE_IDLE_POLL_MS); return }
             scope.launch {
                 val frame = withContext(Dispatchers.IO) { ShizukuBridge.capture(displayId, excluded, LIVE_SHELL_SCALE) }
                 if (liveLoop && phase == Phase.SHOWING && myGen == captureGen && frame != null && !bridging) {
                     (surface as? SnapshotSurface)?.replaceSnapshot(frame)
+                    retire(frame)
                     frames++
                     if (frames == 1 || frames % 25 == 0) Log.i(TAG, "display $displayId: live frame $frames (${frame.width}x${frame.height})")
                 }
                 handler.postDelayed({ tick() }, LIVE_INTERVAL_MS)
             }
         }
-        handler.postDelayed({ tick() }, LIVE_INTERVAL_MS)
+        handler.post { tick() }
     }
 
     private fun clearOverlayState() {
         liveLoop = false
+        handler.removeCallbacks(closeExtrapolation)
         handler.removeCallbacks(settleCheck)
         handler.removeCallbacks(peakHold)
         follower?.cancel()
@@ -595,14 +671,27 @@ class PanelEngine(
         const val COARSE_PEAK_HOLD_MS = 2_500L
         /** Tilt hysteresis for leaving a rest pose, so hinge jitter doesn't fire. */
         const val REST_LEAVE_TILT = 3f
+        /** Look-ahead along the hinge speed, roughly the sensor age plus the follower's lag. */
+        const val PREDICT_S = 0.03f
+        /** °/s below which the hinge counts as still (no prediction, no extrapolation). */
+        const val PREDICT_MIN_SPEED = 20f
+        const val VELOCITY_SMOOTHING = 0.5f
+        /** Held cover closing: below this angle a silent sensor means "it's shutting". */
+        const val CLOSE_EXTRAPOLATE_BELOW = 20f
+        const val CLOSE_QUIET_MS = 70L
+        const val CLOSE_FINISH_TAU_S = 0.05f
+        /** Held cover: leave rest this many degrees past the closed idle. */
+        const val HELD_LEAVE_REST_DEG = 1f
         const val SETTLE_TIMEOUT_MS = 700L
         const val FADE_IN_MS = 140L
         const val FADE_OUT_FLAT_MS = 120L
         const val FADE_OUT_STALLED_MS = 300L
-        /** Shizuku capture: full-size first frame, half-size live frames at ~12 fps. */
+        /** Shizuku capture: full-size first frame, then half-size zero-copy live frames back to back. */
         const val INITIAL_SHELL_SCALE = 1f
         const val LIVE_SHELL_SCALE = 0.5f
-        const val LIVE_INTERVAL_MS = 80L
+        const val LIVE_INTERVAL_MS = 0L
+        /** While there's nothing to refresh (flat, or no layer to exclude yet). */
+        const val LIVE_IDLE_POLL_MS = 32L
         const val SHELL_RETRY_MS = 60L
 
         /**

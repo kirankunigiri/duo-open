@@ -34,6 +34,11 @@ import kotlinx.coroutines.flow.asStateFlow
  *   accessibility screenshot.
  * @param shizukuAngle With Shizuku authorised and Samsung's Fold interactive
  *   wallpaper set, read the continuous hinge angle from it.
+ * @param holdCover With Shizuku authorised, keep the cover screen lit while the
+ *   phone opens (device-state override) instead of letting the system swap to
+ *   the inner screen in the first few degrees, so the cover's fold plays out.
+ * @param holdReleaseHinge Hinge angle at which the held cover hands over to the
+ *   inner screen.
  * @param imageVersion Bumped whenever the wallpaper image changes.
  */
 data class DuoConfig(
@@ -48,6 +53,8 @@ data class DuoConfig(
     val instantStart: Boolean = true,
     val shizukuCapture: Boolean = true,
     val shizukuAngle: Boolean = true,
+    val holdCover: Boolean = true,
+    val holdReleaseHinge: Float = 90f,
     val imageVersion: Long = 0L,
 )
 
@@ -73,6 +80,8 @@ object DuoSettings {
             instantStart = prefs.getBoolean("instantStart", d.instantStart),
             shizukuCapture = prefs.getBoolean("shizukuCapture", d.shizukuCapture),
             shizukuAngle = prefs.getBoolean("shizukuAngle", d.shizukuAngle),
+            holdCover = prefs.getBoolean("holdCover", d.holdCover),
+            holdReleaseHinge = prefs.getFloat("holdReleaseHinge", d.holdReleaseHinge),
             imageVersion = prefs.getLong("imageVersion", d.imageVersion),
         )
     }
@@ -93,6 +102,8 @@ object DuoSettings {
             putBoolean("instantStart", next.instantStart)
             putBoolean("shizukuCapture", next.shizukuCapture)
             putBoolean("shizukuAngle", next.shizukuAngle)
+            putBoolean("holdCover", next.holdCover)
+            putFloat("holdReleaseHinge", next.holdReleaseHinge)
             putLong("imageVersion", next.imageVersion)
         }
     }
@@ -107,6 +118,8 @@ object DuoSettings {
             instantStart = it.instantStart,
             shizukuCapture = it.shizukuCapture,
             shizukuAngle = it.shizukuAngle,
+            holdCover = it.holdCover,
+            holdReleaseHinge = it.holdReleaseHinge,
             imageVersion = it.imageVersion,
         )
     }

@@ -33,7 +33,12 @@ import java.util.regex.Pattern
  *    read logcat. The app pings the wallpaper; this tails the log and calls
  *    back with each fresh value.
  *
- * Both techniques were worked out by Duo Fold Live
+ * 3. **Device-state overrides** (`DeviceStateManagerGlobal.requestState`, which
+ *    needs CONTROL_DEVICE_STATE — the shell has it). The request belongs to
+ *    this process, so if the app (and with it this non-daemon service) dies,
+ *    the system drops the override by itself.
+ *
+ * The first two techniques were worked out by Duo Fold Live
  * (github.com/joeconsorti/duo-fold-live, MIT) — the capture-API resolution
  * and the wallpaper log format in particular follow their findings.
  *
@@ -45,6 +50,7 @@ class DuoShellService : Binder() {
     private var owner = -1
     private var captureApi: CaptureApi? = null
     private var reader: AngleReader? = null
+    private val hold = StateHold()
 
     init {
         attachInterface(null, ShellProtocol.TOKEN)
@@ -57,6 +63,7 @@ class DuoShellService : Binder() {
         }
         if (code == SHIZUKU_DESTROY) {
             reader?.stop()
+            hold.release()
             System.exit(0)
             return true
         }
@@ -79,9 +86,10 @@ class DuoShellService : Binder() {
                 val n = data.readInt()
                 val excluded = Array(n) { data.readTypedObject(SurfaceControl.CREATOR) }
                 val scale = data.readFloat()
+                val hardware = data.dataAvail() > 0 && data.readInt() != 0
                 val identity = clearCallingIdentity()
                 val result = try {
-                    capture(displayId, excluded.filterNotNull().toTypedArray(), scale)
+                    capture(displayId, excluded.filterNotNull().toTypedArray(), scale, hardware)
                 } catch (t: Throwable) {
                     var c: Throwable = t
                     while (c.cause != null) c = c.cause!!
@@ -92,6 +100,9 @@ class DuoShellService : Binder() {
                 }
                 out.writeNoException()
                 out.writeBundle(result)
+                // The parcel holds its own dup of the buffer's fd now.
+                @Suppress("DEPRECATION")
+                (result.getParcelable("buffer") as? HardwareBuffer)?.close()
             }
             ShellProtocol.START_ANGLES -> {
                 val action = data.readString() ?: throw IllegalArgumentException("action")
@@ -108,6 +119,15 @@ class DuoShellService : Binder() {
             ShellProtocol.ANGLE_STATUS -> {
                 out.writeNoException()
                 out.writeBundle(reader?.status() ?: Bundle().apply { putString("state", "not started") })
+            }
+            ShellProtocol.HOLD_STATE -> {
+                val state = data.readInt()
+                out.writeNoException()
+                out.writeBundle(hold.request(state))
+            }
+            ShellProtocol.RELEASE_STATE -> {
+                out.writeNoException()
+                out.writeBundle(hold.release())
             }
             else -> return super.onTransact(code, data, reply, flags)
         }
@@ -167,13 +187,23 @@ class DuoShellService : Binder() {
         throw ClassNotFoundException("no compatible display capture API: $errors")
     }
 
-    private fun capture(displayId: Int, excluded: Array<SurfaceControl>, scale: Float): Bundle {
+    private var wmService: Any? = null
+    private var dmService: Any? = null
+    private var getDisplayInfo: Method? = null
+
+    /**
+     * @param hardware Return the compositor's HardwareBuffer itself (zero-copy,
+     *   the fd is shared over binder) instead of reading it back into an
+     *   ARGB bitmap — the difference between ~9 and ~60 live frames a second.
+     */
+    private fun capture(displayId: Int, excluded: Array<SurfaceControl>, scale: Float, hardware: Boolean): Bundle {
         val t0 = SystemClock.elapsedRealtime()
         val api = api()
-        val wm = systemService("window", "android.view.IWindowManager\$Stub")
-        val dm = systemService("display", "android.hardware.display.IDisplayManager\$Stub")
-        val info = Class.forName("android.hardware.display.IDisplayManager").getMethod("getDisplayInfo", Integer.TYPE)
-            .invoke(dm, displayId) ?: throw IllegalStateException("no display $displayId")
+        val wm = wmService ?: systemService("window", "android.view.IWindowManager\$Stub").also { wmService = it }
+        val dm = dmService ?: systemService("display", "android.hardware.display.IDisplayManager\$Stub").also { dmService = it }
+        val gdi = getDisplayInfo ?: Class.forName("android.hardware.display.IDisplayManager")
+            .getMethod("getDisplayInfo", Integer.TYPE).also { getDisplayInfo = it }
+        val info = gdi.invoke(dm, displayId) ?: throw IllegalStateException("no display $displayId")
         val w = info.javaClass.getField("logicalWidth").getInt(info)
         val h = info.javaClass.getField("logicalHeight").getInt(info)
         if (w <= 0 || h <= 0) throw IllegalStateException("display $displayId has no size")
@@ -206,10 +236,26 @@ class DuoShellService : Binder() {
             val secure = runCatching {
                 result.javaClass.getMethod("containsSecureLayers").invoke(result) as Boolean
             }.getOrDefault(false)
-            val hardware = result.javaClass.getMethod("asBitmap").invoke(result) as? Bitmap
+            if (hardware && buffer != null) {
+                val colorSpace = runCatching {
+                    (result.javaClass.getMethod("getColorSpace").invoke(result) as? android.graphics.ColorSpace)?.id
+                }.getOrNull() ?: -1
+                val sent = buffer
+                buffer = null // closed by the caller once parcelled
+                return Bundle().apply {
+                    putBoolean("ok", true)
+                    putParcelable("buffer", sent)
+                    putInt("colorSpace", colorSpace)
+                    putInt("width", w)
+                    putInt("height", h)
+                    putBoolean("secure", secure)
+                    putLong("ms", SystemClock.elapsedRealtime() - t0)
+                }
+            }
+            val hwBitmap = result.javaClass.getMethod("asBitmap").invoke(result) as? Bitmap
                 ?: throw IllegalStateException("frame not readable")
-            val bitmap = hardware.copy(Bitmap.Config.ARGB_8888, false)
-            hardware.recycle()
+            val bitmap = hwBitmap.copy(Bitmap.Config.ARGB_8888, false)
+            hwBitmap.recycle()
             return Bundle().apply {
                 putBoolean("ok", true)
                 putParcelable("bitmap", bitmap)
@@ -220,6 +266,93 @@ class DuoShellService : Binder() {
             }
         } finally {
             buffer?.close()
+        }
+    }
+
+    // ---- device-state override ----------------------------------------------
+
+    /**
+     * One device-state override at a time through the framework's own client
+     * (`DeviceStateManagerGlobal`), so the request token and the process
+     * callback the service insists on are handled exactly as for a system app.
+     */
+    private class StateHold {
+        private var global: Any? = null
+        @Volatile private var held = -1
+        /** What the app wants held; the system drops overrides when the base state returns to CLOSED. */
+        @Volatile private var desired = -1
+        @Volatile private var lastEvent = "none"
+
+        private fun global(): Any = global ?: Class.forName("android.hardware.devicestate.DeviceStateManagerGlobal")
+            .getMethod("getInstance").invoke(null)
+            ?.also { global = it }
+            ?: throw IllegalStateException("device_state service unavailable")
+
+        fun request(state: Int): Bundle = result {
+            desired = state
+            requestInternal(state)
+        }
+
+        @Synchronized
+        private fun requestInternal(state: Int) {
+            if (held == state) return
+            if (held >= 0) cancel()
+            val reqClass = Class.forName("android.hardware.devicestate.DeviceStateRequest")
+            val builder = reqClass.getMethod("newBuilder", Integer.TYPE).invoke(null, state)!!
+            val request = builder.javaClass.getMethod("build").invoke(builder)
+            val cbClass = Class.forName("android.hardware.devicestate.DeviceStateRequest\$Callback")
+            val callback = java.lang.reflect.Proxy.newProxyInstance(cbClass.classLoader, arrayOf(cbClass)) { proxy, m, args ->
+                when (m.name) {
+                    "onRequestActivated", "onRequestSuspended", "onRequestCanceled" -> {
+                        lastEvent = "${m.name}(${args?.firstOrNull()})"
+                        if (m.name == "onRequestCanceled") {
+                            held = -1
+                            // Closing back without the app letting go (base → CLOSED
+                            // cancels overrides): put the hold straight back.
+                            val want = desired
+                            if (want >= 0) Thread {
+                                Thread.sleep(REASSERT_DELAY_MS)
+                                if (desired == want) runCatching { requestInternal(want) }
+                                    .onSuccess { lastEvent = "re-held $want" }
+                            }.start()
+                        }
+                        null
+                    }
+                    "hashCode" -> System.identityHashCode(proxy)
+                    "equals" -> proxy === args?.firstOrNull()
+                    "toString" -> "DuoStateHoldCallback"
+                    else -> null
+                }
+            }
+            val executor = java.util.concurrent.Executor { it.run() }
+            global().javaClass.getMethod(
+                "requestState", reqClass, java.util.concurrent.Executor::class.java, cbClass,
+            ).invoke(global(), request, executor, callback)
+            held = state
+        }
+
+        fun release(): Bundle = result {
+            desired = -1
+            if (held >= 0) cancel()
+        }
+
+        private fun cancel() {
+            global().javaClass.getMethod("cancelStateRequest").invoke(global())
+            held = -1
+        }
+
+        private inline fun result(block: () -> Unit): Bundle = Bundle().apply {
+            try {
+                block()
+                putBoolean("ok", true)
+            } catch (t: Throwable) {
+                var c: Throwable = t
+                while (c.cause != null) c = c.cause!!
+                putBoolean("ok", false)
+                putString("error", "${c.javaClass.simpleName}: ${c.message}")
+            }
+            putInt("held", held)
+            putString("event", lastEvent)
         }
     }
 
@@ -324,6 +457,7 @@ class DuoShellService : Binder() {
     private companion object {
         /** Shizuku asks user services to exit with this code. */
         const val SHIZUKU_DESTROY = 16777115
+        const val REASSERT_DELAY_MS = 30L
         val FAMILIES = listOf("android.window.ScreenCaptureInternal", "android.window.ScreenCapture")
     }
 }

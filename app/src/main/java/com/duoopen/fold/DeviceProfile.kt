@@ -21,6 +21,11 @@ data class DeviceProfile(
     val skipCoverBelowHinge: Float,
     /** Physical aspect below which a panel counts as the inner one. */
     val innerMaxAspect: Float = 1.45f,
+    /**
+     * Device state that keeps only the cover lit with the same layout as
+     * CLOSED, used to hold the cover on while opening; null = unsupported.
+     */
+    val coverHoldState: Int? = null,
 ) {
     companion object {
         /** OnePlus Open: swaps at ~20°, idles 0–5° closed, rests at 176–179° open. */
@@ -46,6 +51,9 @@ data class DeviceProfile(
             closedHinge = 2f,
             skipInnerAboveHinge = 150f,
             skipCoverBelowHinge = -1f,
+            // SUB_SCREEN_ONLY_DEFAULT: cover = display 0, inner off — the CLOSED
+            // layout, so entering it from CLOSED changes nothing on screen.
+            coverHoldState = 102,
         )
 
         val current: DeviceProfile by lazy { detect(Build.MANUFACTURER, Build.MODEL, Build.DEVICE) }

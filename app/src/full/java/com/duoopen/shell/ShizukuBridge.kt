@@ -5,6 +5,8 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.content.ServiceConnection
 import android.graphics.Bitmap
+import android.graphics.ColorSpace
+import android.hardware.HardwareBuffer
 import android.os.Binder
 import android.os.Bundle
 import android.os.IBinder
@@ -150,19 +152,40 @@ object ShizukuBridge {
 
     fun ping(): Bundle? = call(ShellProtocol.PING)
 
-    /** Blocking; call off the main thread. Null if unavailable or the frame had secure content. */
+    private val colorSpaces: List<ColorSpace> by lazy { ColorSpace.Named.entries.map { ColorSpace.get(it) } }
+
+    /**
+     * Blocking; call off the main thread. Null if unavailable or the frame had
+     * secure content. Returns a hardware bitmap wrapping the compositor's own
+     * buffer (zero-copy) when the helper supports it, else a software copy.
+     */
     fun capture(displayId: Int, excluded: List<SurfaceControl>, scale: Float): Bitmap? {
         val b = call(ShellProtocol.CAPTURE) { p ->
             p.writeInt(displayId)
             p.writeInt(excluded.size)
             excluded.forEach { p.writeTypedObject(it, 0) }
             p.writeFloat(scale)
+            p.writeInt(1) // hardware buffer, please
         } ?: return null
         if (!b.getBoolean("ok")) {
             Log.w(TAG, "shell capture failed: ${b.getString("error")}")
             return null
         }
-        if (b.getBoolean("secure")) return null
+        @Suppress("DEPRECATION")
+        val buffer = b.getParcelable<HardwareBuffer>("buffer")
+        if (b.getBoolean("secure")) {
+            buffer?.close()
+            return null
+        }
+        if (buffer != null) {
+            val id = b.getInt("colorSpace", -1)
+            val cs = colorSpaces.firstOrNull { it.id == id } ?: ColorSpace.get(ColorSpace.Named.SRGB)
+            return try {
+                Bitmap.wrapHardwareBuffer(buffer, cs)
+            } finally {
+                buffer.close() // the bitmap keeps its own reference
+            }
+        }
         @Suppress("DEPRECATION")
         return b.getParcelable("bitmap")
     }
@@ -195,4 +218,17 @@ object ShizukuBridge {
     }
 
     fun angleStatus(): Bundle? = call(ShellProtocol.ANGLE_STATUS)
+
+    /** Blocking binder call (~ms). Overrides the device state until [releaseState] or the app dies. */
+    fun holdState(state: Int): Boolean {
+        val b = call(ShellProtocol.HOLD_STATE) { it.writeInt(state) } ?: return false
+        if (!b.getBoolean("ok")) Log.w(TAG, "hold state $state failed: ${b.getString("error")}")
+        return b.getBoolean("ok")
+    }
+
+    fun releaseState(): Boolean {
+        val b = call(ShellProtocol.RELEASE_STATE) ?: return false
+        if (!b.getBoolean("ok")) Log.w(TAG, "release state failed: ${b.getString("error")}")
+        return b.getBoolean("ok")
+    }
 }

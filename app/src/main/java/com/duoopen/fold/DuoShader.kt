@@ -65,7 +65,8 @@ object DuoShader {
      * so the frost keeps resolving the whole way open. Intensity scales it.
      */
     fun tiltForHinge(hingeDegrees: Float, config: DuoConfig): Float {
-        val progress = ((FLAT_HINGE - hingeDegrees) / (FLAT_HINGE - PANEL_ON_HINGE)).coerceIn(0f, 1f)
+        val start = FoldHoldState.innerStartHinge.takeIf { it.isFinite() && it < FLAT_HINGE - 10f } ?: PANEL_ON_HINGE
+        val progress = ((FLAT_HINGE - hingeDegrees) / (FLAT_HINGE - start)).coerceIn(0f, 1f)
         val full = if (config.movingSide == 0) MAX_TILT * 0.6f else MAX_TILT
         return (progress * full * config.intensity).coerceIn(0f, MAX_TILT)
     }
@@ -75,7 +76,10 @@ object DuoShader {
      * [PANEL_ON_HINGE] degrees: flat when closed, fully frosted at the swap.
      */
     fun coverTiltForHinge(hingeDegrees: Float, config: DuoConfig): Float {
-        val progress = ((hingeDegrees - CLOSED_HINGE) / (PANEL_ON_HINGE - CLOSED_HINGE)).coerceIn(0f, 1f)
+        // Held lit past the system's swap point (FoldHoldState): spread the
+        // frost over the whole held range instead of peaking in a few degrees.
+        val end = FoldHoldState.coverHeldUntil.takeIf { it.isFinite() && it > CLOSED_HINGE + 5f } ?: PANEL_ON_HINGE
+        val progress = ((hingeDegrees - CLOSED_HINGE) / (end - CLOSED_HINGE)).coerceIn(0f, 1f)
         return (progress * MAX_TILT * config.intensity).coerceIn(0f, MAX_TILT)
     }
 

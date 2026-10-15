@@ -34,6 +34,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.LifecycleResumeEffect
+import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.duoopen.DualScreen
 import com.duoopen.fold.DuoShader
@@ -59,9 +60,11 @@ fun DuoApp(foldLineFlow: StateFlow<FoldLine?>, dualScreen: DualScreen? = null) {
 
     var hingeAngle by remember { mutableFloatStateOf(Float.NaN) }
     val hinge = remember { HingeAngleSource(context.applicationContext) { hingeAngle = it } }
-    DisposableEffect(hinge) {
+    // Only while the app is on screen: in the background every hinge reading
+    // would recompose this UI on the main thread the fold overlay shares.
+    LifecycleStartEffect(hinge) {
         hinge.start()
-        onDispose { hinge.stop() }
+        onStopOrDispose { hinge.stop() }
     }
 
     // Without a hinge sensor (emulator, non-foldable) the slider is the only input.
